@@ -1,12 +1,31 @@
 import os
 import csv
 import sqlite3
-import pandas as pd
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime
+import pandas as pd
 import telebot
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 from pdf_reader import extract_price_list_with_ai
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # keeps console logs clean
+
+
+def start_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
 
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -19,10 +38,12 @@ bot = telebot.TeleBot(TOKEN)
 # --- DATABASE SETUP ---
 DB_NAME = "database.db"
 
+
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
+    cursor.execute("PRAGMA foreign_keys = ON;")
+
     # Suppliers table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS suppliers (
@@ -34,7 +55,7 @@ def init_db():
             UNIQUE(user_id, name)
         )
     ''')
-    
+
     # Products catalog table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS products (
@@ -68,11 +89,13 @@ def init_db():
             FOREIGN KEY (order_id) REFERENCES orders (id) ON DELETE CASCADE
         )
     ''')
-    
+
     conn.commit()
     conn.close()
 
+
 init_db()
+
 
 # --- PERSISTENT REPLY KEYBOARD (BOXY MENU) ---
 def get_main_keyboard():
@@ -83,9 +106,11 @@ def get_main_keyboard():
         KeyboardButton("🛒 Generate Order"),
         KeyboardButton("📜 Order History"),
         KeyboardButton("📂 View Suppliers"),
-        KeyboardButton("📁 Export CSV")
+        KeyboardButton("📁 Export CSV"),
+        KeyboardButton("🗑️ Clear My Data")
     )
     return markup
+
 
 def get_saved_catalogs(user_id):
     """Fetch catalogs strictly isolated to the specific user_id."""
@@ -93,15 +118,16 @@ def get_saved_catalogs(user_id):
     cursor = conn.cursor()
     cursor.execute("SELECT id, name FROM suppliers WHERE user_id = ?", (user_id,))
     suppliers = cursor.fetchall()
-    
+
     catalogs = {}
     for sup_id, sup_name in suppliers:
         cursor.execute("SELECT product_name, price FROM products WHERE supplier_id = ?", (sup_id,))
         items = cursor.fetchall()
         catalogs[sup_name] = {prod: price for prod, price in items}
-    
+
     conn.close()
     return catalogs
+
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -113,10 +139,11 @@ def send_welcome(message):
     )
     bot.reply_to(message, help_text, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
+
 # --- PERSISTENT MENU BUTTON ROUTING ---
 @bot.message_handler(func=lambda message: message.text in [
-    "📊 Compare Prices", "🔍 Search Product", "🛒 Generate Order", 
-    "📜 Order History", "📂 View Suppliers", "📁 Export CSV"
+    "📊 Compare Prices", "🔍 Search Product", "🛒 Generate Order",
+    "📜 Order History", "📂 View Suppliers", "📁 Export CSV", "🗑️ Clear My Data"
 ])
 def handle_persistent_menu(message):
     if message.text == "📊 Compare Prices":
@@ -126,11 +153,11 @@ def handle_persistent_menu(message):
         bot.register_next_step_handler(sent_msg, execute_search)
     elif message.text == "🛒 Generate Order":
         sent_msg = bot.reply_to(
-            message, 
+            message,
             "🛒 **Order Generator**\n\n"
             "Please send the items and quantities you need in this format:\n"
             "`product name: quantity, product name: quantity`\n\n"
-            "*Example:* `ryzen 5: 2, rtx 4060: 4`", 
+            "*Example:* `ryzen 5: 2, rtx 4060: 4`",
             parse_mode="Markdown"
         )
         bot.register_next_step_handler(sent_msg, process_order_generation)
@@ -140,12 +167,70 @@ def handle_persistent_menu(message):
         show_suppliers_menu(message)
     elif message.text == "📁 Export CSV":
         export_comparison_csv(message)
+    elif message.text == "🗑️ Clear My Data":
+        ask_clear_account_data(message)
+
+
+# --- ACCOUNT DATA DELETION ---
+def ask_clear_account_data(message):
+    user_id = message.from_user.id
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM suppliers WHERE user_id = ?", (user_id,))
+    sup_count = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (user_id,))
+    ord_count = cursor.fetchone()[0]
+    conn.close()
+
+    if sup_count == 0 and ord_count == 0:
+        bot.reply_to(
+            message,
+            "ℹ️ Your account already has no saved suppliers, products, or orders.",
+            reply_markup=get_main_keyboard()
+        )
+        return
+
+    markup = InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        InlineKeyboardButton("⚠️ Yes, Delete All My Data", callback_data="confirm_clear_data"),
+        InlineKeyboardButton("❌ Cancel", callback_data="cancel_clear_data")
+    )
+
+    warning_text = (
+        "⚠️ **Delete Account Data?**\n\n"
+        f"This will permanently remove your **{sup_count}** supplier catalog(s) (and their products) "
+        f"and **{ord_count}** order record(s) from your account.\n"
+        "Other users' data will not be affected."
+    )
+    bot.reply_to(message, warning_text, parse_mode="Markdown", reply_markup=markup)
+
+
+def delete_user_account_data(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA foreign_keys = ON;")
+
+    cursor.execute(
+        "DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE user_id = ?)",
+        (user_id,)
+    )
+    cursor.execute("DELETE FROM orders WHERE user_id = ?", (user_id,))
+
+    cursor.execute(
+        "DELETE FROM products WHERE supplier_id IN (SELECT id FROM suppliers WHERE user_id = ?)",
+        (user_id,)
+    )
+    cursor.execute("DELETE FROM suppliers WHERE user_id = ?", (user_id,))
+
+    conn.commit()
+    conn.close()
+
 
 # --- STEP 3: ORDER GENERATOR ENGINE ---
 def process_order_generation(message):
     user_id = message.from_user.id
     raw_input = message.text.strip()
-    
+
     if raw_input.startswith('/'):
         return
 
@@ -206,8 +291,8 @@ def process_order_generation(message):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    
-    cursor.execute("INSERT INTO orders (user_id, created_at, total_amount) VALUES (?, ?, ?)", 
+
+    cursor.execute("INSERT INTO orders (user_id, created_at, total_amount) VALUES (?, ?, ?)",
                    (user_id, timestamp, grand_total))
     order_id = cursor.lastrowid
 
@@ -222,7 +307,7 @@ def process_order_generation(message):
     conn.close()
 
     report = f"🛒 **Generated Purchase Order**\n📅 {timestamp}\n\n"
-    
+
     for supplier, entries in supplier_orders.items():
         report += f"🏢 **Supplier: {supplier}**\n"
         sup_total = 0
@@ -240,6 +325,7 @@ def process_order_generation(message):
         report = report[:4000] + "\n\n*(Truncated)*"
 
     bot.reply_to(message, report, parse_mode="Markdown", reply_markup=get_main_keyboard())
+
 
 # --- ORDER HISTORY VIEW ---
 def show_order_history(message):
@@ -259,6 +345,7 @@ def show_order_history(message):
         text += f"🆔 **Order #{order_id}** — {created_at}\n   💰 Total: **₹{total:.2f}**\n\n"
 
     bot.reply_to(message, text, parse_mode="Markdown", reply_markup=get_main_keyboard())
+
 
 # --- SUPPLIER MANAGEMENT MENU (INLINE) ---
 def show_suppliers_menu(message):
@@ -281,12 +368,34 @@ def show_suppliers_menu(message):
 
     bot.reply_to(message, "🎛️ **Your Supplier Management Options:**", reply_markup=markup)
 
+
 @bot.callback_query_handler(func=lambda call: True)
 def handle_callback_query(call):
     user_id = call.from_user.id
+
+    if call.data == "confirm_clear_data":
+        delete_user_account_data(user_id)
+        bot.answer_callback_query(call.id, "All your account data has been deleted.")
+        bot.edit_message_text(
+            "🗑️ **All data for your account has been deleted** (suppliers, products, and order history).",
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="Markdown"
+        )
+        return
+
+    if call.data == "cancel_clear_data":
+        bot.answer_callback_query(call.id, "Deletion cancelled.")
+        bot.edit_message_text(
+            "✅ Cancelled. Your account data is safe.",
+            call.message.chat.id,
+            call.message.message_id
+        )
+        return
+
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
+
     if call.data == "menu_list":
         cursor.execute("SELECT name, filename, updated_at FROM suppliers WHERE user_id = ?", (user_id,))
         suppliers = cursor.fetchall()
@@ -294,7 +403,7 @@ def handle_callback_query(call):
             bot.answer_callback_query(call.id, "No suppliers found in your account.")
             conn.close()
             return
-        
+
         text = "📁 **Your Active Suppliers & Source Files:**\n\n"
         for name, filename, updated in suppliers:
             text += f"🏢 **{name}**\n   • File: `{filename}`\n   • Updated: {updated}\n\n"
@@ -307,12 +416,12 @@ def handle_callback_query(call):
             bot.answer_callback_query(call.id, "No suppliers to delete.")
             conn.close()
             return
-        
+
         markup = InlineKeyboardMarkup()
         for sup_id, name, filename in suppliers:
             markup.add(InlineKeyboardButton(f"❌ Delete {name} ({filename})", callback_data=f"del_{sup_id}"))
         markup.add(InlineKeyboardButton("🔙 Back", callback_data="menu_back"))
-        
+
         bot.edit_message_text("🗑️ Select a supplier to remove from your account:", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
     elif call.data.startswith("del_"):
@@ -322,6 +431,7 @@ def handle_callback_query(call):
         conn.close()
         bot.answer_callback_query(call.id, "Supplier deleted successfully!")
         bot.edit_message_text("✅ Supplier catalog deleted from your database.", call.message.chat.id, call.message.message_id)
+        return
 
     elif call.data == "menu_update":
         cursor.execute("SELECT id, name, filename FROM suppliers WHERE user_id = ?", (user_id,))
@@ -330,12 +440,12 @@ def handle_callback_query(call):
             bot.answer_callback_query(call.id, "No suppliers available to update.")
             conn.close()
             return
-        
+
         markup = InlineKeyboardMarkup()
         for sup_id, name, filename in suppliers:
             markup.add(InlineKeyboardButton(f"🔄 Update {name} (Current: {filename})", callback_data=f"upd_{sup_id}"))
         markup.add(InlineKeyboardButton("🔙 Back", callback_data="menu_back"))
-        
+
         bot.edit_message_text("🔄 Select which supplier file you want to update/replace:", call.message.chat.id, call.message.message_id, reply_markup=markup)
 
     elif call.data.startswith("upd_"):
@@ -343,17 +453,20 @@ def handle_callback_query(call):
         cursor.execute("SELECT name FROM suppliers WHERE id = ? AND user_id = ?", (sup_id, user_id))
         res = cursor.fetchone()
         conn.close()
-        
+
         if res:
             sup_name = res[0]
             sent_msg = bot.edit_message_text(f"📥 Please upload the **new file (PDF, XLSX, or CSV)** update for **{sup_name}**:", call.message.chat.id, call.message.message_id, parse_mode="Markdown")
             bot.register_next_step_handler(sent_msg, process_supplier_update, sup_name)
+        return
 
     elif call.data == "menu_back":
         conn.close()
         bot.delete_message(call.message.chat.id, call.message.message_id)
+        return
 
     conn.close()
+
 
 def process_supplier_update(message, target_supplier_name):
     if not message.document:
@@ -361,23 +474,25 @@ def process_supplier_update(message, target_supplier_name):
         return
     handle_uploaded_file(message, override_supplier=target_supplier_name)
 
+
 # --- MULTI-FORMAT FILE INGESTION (PDF, XLSX, CSV) ---
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     handle_uploaded_file(message)
+
 
 def handle_uploaded_file(message, override_supplier=None):
     try:
         user_id = message.from_user.id
         file_info = bot.get_file(message.document.file_id)
         filename = message.document.file_name.lower()
-        
+
         bot.reply_to(message, "📥 Downloading and parsing file data for your account...")
 
         downloaded_file = bot.download_file(file_info.file_path)
         os.makedirs("files/input", exist_ok=True)
         local_path = f"files/input/{message.document.file_name}"
-        
+
         with open(local_path, "wb") as f:
             f.write(downloaded_file)
 
@@ -402,25 +517,25 @@ def handle_uploaded_file(message, override_supplier=None):
 
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        
+
         cursor.execute("SELECT id FROM suppliers WHERE user_id = ? AND name = ?", (user_id, company_name))
         row = cursor.fetchone()
-        
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
         if row:
             sup_id = row[0]
-            cursor.execute("UPDATE suppliers SET filename = ?, updated_at = ? WHERE id = ?", 
+            cursor.execute("UPDATE suppliers SET filename = ?, updated_at = ? WHERE id = ?",
                            (message.document.file_name, timestamp, sup_id))
             cursor.execute("DELETE FROM products WHERE supplier_id = ?", (sup_id,))
         else:
-            cursor.execute("INSERT INTO suppliers (user_id, name, filename, updated_at) VALUES (?, ?, ?, ?)", 
+            cursor.execute("INSERT INTO suppliers (user_id, name, filename, updated_at) VALUES (?, ?, ?, ?)",
                            (user_id, company_name, message.document.file_name, timestamp))
             sup_id = cursor.lastrowid
 
         for prod_name, price in products.items():
-            cursor.execute("INSERT INTO products (supplier_id, product_name, price) VALUES (?, ?, ?)", 
+            cursor.execute("INSERT INTO products (supplier_id, product_name, price) VALUES (?, ?, ?)",
                            (sup_id, prod_name, price))
-        
+
         conn.commit()
         conn.close()
 
@@ -430,11 +545,12 @@ def handle_uploaded_file(message, override_supplier=None):
     except Exception as e:
         bot.reply_to(message, f"❌ An error occurred: {e}")
 
+
 def parse_dataframe(df):
     df.columns = [str(col).strip().lower() for col in df.columns]
     prod_col = next((col for col in df.columns if 'product' in col or 'item' in col or 'name' in col), df.columns[0])
     price_col = next((col for col in df.columns if 'price' in col or 'rate' in col or 'cost' in col), df.columns[1])
-    
+
     products = {}
     for _, row in df.iterrows():
         name = str(row[prod_col]).strip().lower()
@@ -446,6 +562,7 @@ def parse_dataframe(df):
             continue
     return products
 
+
 # --- SEARCH, COMPARE & EXPORT ---
 @bot.message_handler(commands=['search', 'find'])
 def search_prompt(message):
@@ -455,7 +572,7 @@ def search_prompt(message):
         query = parts[1].strip().lower() if len(parts) > 1 else ""
     else:
         query = raw_text.lower()
-    
+
     if not query:
         sent_msg = bot.reply_to(message, "🔍 Please enter the product name you want to search for:")
         bot.register_next_step_handler(sent_msg, execute_search)
@@ -463,12 +580,14 @@ def search_prompt(message):
 
     run_search_logic(message, query)
 
+
 def execute_search(message):
     query = message.text.strip().lower()
     if not query:
         bot.reply_to(message, "⚠️ Search cancelled.")
         return
     run_search_logic(message, query)
+
 
 def run_search_logic(message, query):
     user_id = message.from_user.id
@@ -507,6 +626,7 @@ def run_search_logic(message, query):
 
     bot.reply_to(message, response_text, parse_mode="Markdown", reply_markup=get_main_keyboard())
 
+
 @bot.message_handler(commands=['compare'])
 def compare_prices(message):
     user_id = message.from_user.id
@@ -523,18 +643,18 @@ def compare_prices(message):
         all_products.update(catalog.keys())
 
     comparison_text = f"📊 **Price Comparison Report** ({len(supplier_names)} Suppliers)\n\n"
-    
+
     matched_count = 0
     for product in sorted(all_products):
         prices = {}
         for supplier in supplier_names:
             if product in SAVED_CATALOGS[supplier]:
                 prices[supplier] = SAVED_CATALOGS[supplier][product]
-        
+
         if len(prices) > 1:
             matched_count += 1
             cheapest_supplier = min(prices, key=prices.get)
-            
+
             comparison_text += f"🔹 **{product.title()}**\n"
             for supplier, price in prices.items():
                 if supplier == cheapest_supplier:
@@ -545,11 +665,12 @@ def compare_prices(message):
 
     if matched_count == 0:
         comparison_text += "⚠️ No exact matching product names found across your uploaded suppliers yet."
-    
+
     if len(comparison_text) > 4000:
         comparison_text = comparison_text[:4000] + "\n\n*(Truncated due to length)*"
 
     bot.reply_to(message, comparison_text, parse_mode="Markdown", reply_markup=get_main_keyboard())
+
 
 @bot.message_handler(commands=['export'])
 def export_comparison_csv(message):
@@ -581,23 +702,23 @@ def export_comparison_csv(message):
                 for supplier in supplier_names:
                     if product in SAVED_CATALOGS[supplier]:
                         prices[supplier] = SAVED_CATALOGS[supplier][product]
-                
+
                 if len(prices) > 1:
                     cheapest_supplier = min(prices, key=prices.get)
                     lowest_price = prices[cheapest_supplier]
-                    
+
                     row = [product]
                     for supplier in supplier_names:
                         row.append(prices.get(supplier, "N/A"))
                     row.append(lowest_price)
                     row.append(cheapest_supplier)
-                    
+
                     writer.writerow(row)
 
         with open(csv_filename, 'rb') as doc:
             bot.send_document(
-                message.chat.id, 
-                doc, 
+                message.chat.id,
+                doc,
                 caption="📁 Here is your multi-supplier price comparison report!",
                 reply_markup=get_main_keyboard()
             )
@@ -605,6 +726,8 @@ def export_comparison_csv(message):
     except Exception as e:
         bot.reply_to(message, f"❌ Error generating export: {e}")
 
+
 if __name__ == "__main__":
+    start_health_server()
     print("🤖 PriceSync Bot is running successfully...")
     bot.infinity_polling(skip_pending=True)
